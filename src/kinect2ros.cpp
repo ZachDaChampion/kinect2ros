@@ -1,288 +1,277 @@
-#include <cv_bridge/cv_bridge.h>
+#include "kinect2ros/kinect2ros.hpp"
 
-#include <cstdio>
-#include <libfreenect2/libfreenect2.hpp>
-#include <opencv2/opencv.hpp>
-#include <rclcpp/rclcpp.hpp>
-
+using namespace std::chrono_literals;
+using namespace camera_info_manager;
+using namespace libfreenect2;
 using namespace std;
-using namespace cv;
-using rcl_interfaces::msg::ParameterDescriptor;
 
-bool should_shutdown = false;  ///< Set to true to shut down the node.
+static const bool IS_BIGENDIAN = false;  // TODO: Determine this programmatically
 
-/**
- * Handle SIGINT by setting a global flag to shut down.
- *
- * @param[in] s The signal number.
- */
-void sigint_handler(int s)
+//                                                                                                //
+// ======================================== Constructor ========================================= //
+//                                                                                                //
+
+Kinect2RosNode::Kinect2RosNode(const rclcpp::NodeOptions& node_options)
+  : Node("kinect2ros", node_options)
 {
-  (void)s;
-  should_shutdown = true;
-}
+  // Declare parameters
+  color_frame_ = this->declare_parameter<string>("color_frame", "kinect_color_frame");
+  depth_frame_ = this->declare_parameter<string>("depth_frame", "kinect_depth_frame");
+  camera_topic_ = this->declare_parameter<string>("camera_topic", "kinect");
+  device_id_ = this->declare_parameter<string>("device_id", "");
+  enable_pointcloud_ = this->declare_parameter<bool>("enable_pointcloud_", true);
+  filter_pointcloud_ = this->declare_parameter<bool>("filter_pointcloud_", true);
+  auto color_calibration_file = this->declare_parameter<string>("color_calibration_file",
+                                                                "package://kinect2ros/"
+                                                                "color_camera_calibration/"
+                                                                "ost.yaml");
+  auto depth_calibration_file = this->declare_parameter<string>("depth_calibration_file",
+                                                                "package://kinect2ros/"
+                                                                "depth_camera_calibration/"
+                                                                "ost.yaml");
 
-/**
- * A ROS2 node that publishes data from a Kinect v2 using libfreenect2.
- */
-class Kinect2ROS : public rclcpp::Node
-{
-public:
-  /**
-   * Construct a new Kinect2ROS object.
-   */
-  Kinect2ROS() : Node("kinect2ros")
-  {
-    RCLCPP_INFO(this->get_logger(), "kinect2ros node has been created");
+  auto logger = this->get_logger();
 
-    /*
-     * Declare parameters.
-     */
+  // Create the image transport publishers.
+  color_cinfo_pub_ = image_transport::create_camera_publisher(this, camera_topic_ + "/color/image");
+  depth_cinfo_pub_ = image_transport::create_camera_publisher(this, camera_topic_ + "/depth/image");
 
-    auto device_id_desc = ParameterDescriptor();
-    device_id_desc.description = "The serial number of the Kinect v2 device to use.";
-    this->declare_parameter("device_id", "", device_id_desc);
+  // Create the camera info managers.
+  color_cinfo_manager_ = std::make_shared<CameraInfoManager>(this);
+  depth_cinfo_manager_ = std::make_shared<CameraInfoManager>(this);
+  color_cinfo_manager_->loadCameraInfo(color_calibration_file);
+  depth_cinfo_manager_->loadCameraInfo(depth_calibration_file);
 
-    auto registration_desc = ParameterDescriptor();
-    registration_desc.description = "Whether to register the depth image to the color image.";
-    this->declare_parameter("depth", true, registration_desc);
+  if (enable_pointcloud_) {
+    // Initialize the pointcloud message with 4 fields (x, y, z, rgb).
+    pointcloud_msg_ = std::make_shared<sensor_msgs::msg::PointCloud2>();
+    pointcloud_msg_->header.frame_id = depth_frame_;
+    pointcloud_msg_->height = DEPTH_HEIGHT;
+    pointcloud_msg_->width = DEPTH_WIDTH;
+    pointcloud_msg_->fields.reserve(4);
+    pointcloud_msg_->fields.emplace_back(
+        create_point_field("x", 0, sensor_msgs::msg::PointField::FLOAT32, 1));
+    pointcloud_msg_->fields.emplace_back(
+        create_point_field("y", 4, sensor_msgs::msg::PointField::FLOAT32, 1));
+    pointcloud_msg_->fields.emplace_back(
+        create_point_field("z", 8, sensor_msgs::msg::PointField::FLOAT32, 1));
+    pointcloud_msg_->fields.emplace_back(
+        create_point_field("rgb", 12, sensor_msgs::msg::PointField::UINT8, 3));
+    pointcloud_msg_->is_bigendian = IS_BIGENDIAN;
+    pointcloud_msg_->point_step = (4 * 3) + (1 * 3);  // 3 floats, 3 uint8s
+    pointcloud_msg_->row_step = pointcloud_msg_->point_step * DEPTH_WIDTH;
+    pointcloud_msg_->data.reserve(pointcloud_msg_->row_step * DEPTH_HEIGHT);
+    pointcloud_msg_->is_dense = !filter_pointcloud_;
 
-    auto compress_color_desc = ParameterDescriptor();
-    compress_color_desc.description = "Whether to compress the color image.";
-    this->declare_parameter("compress_color", true, compress_color_desc);
-
-    auto upscale_depth_desc = ParameterDescriptor();
-    upscale_depth_desc.description =
-        "Whether to upscale the depth image to the resolution of the color image. Otherwise, "
-        "both images will be at the resolution of the depth camera.";
-    this->declare_parameter("upscale_depth", true, upscale_depth_desc);
-
-    auto color_topic_desc = ParameterDescriptor();
-    color_topic_desc.description = "The topic on which to publish color images.";
-    this->declare_parameter("color_topic", "color", color_topic_desc);
-
-    auto depth_topic_desc = ParameterDescriptor();
-    depth_topic_desc.description = "The topic on which to publish depth images.";
-    this->declare_parameter("depth_topic", "depth", depth_topic_desc);
-
-    //  Read parameter values.
-    _compress_color = this->get_parameter("compress_color").as_bool();
-    _device_id = this->get_parameter("device_id").as_string();
-    _registration = this->get_parameter("depth").as_bool();
-    _upscale_depth = this->get_parameter("upscale_depth").as_bool();
-    string color_topic = this->get_parameter("color_topic").as_string();
-    string depth_topic = this->get_parameter("depth_topic").as_string();
-
-    /*
-     * Create publishers.
-     */
-
-    if (_compress_color)
-      _color_pub_compressed =
-          this->create_publisher<sensor_msgs::msg::CompressedImage>(color_topic, 1);
-    else
-      _color_pub_uncompressed = this->create_publisher<sensor_msgs::msg::Image>(color_topic, 1);
-    _depth_pub = this->create_publisher<sensor_msgs::msg::Image>(depth_topic, 1);
+    // Create the pointcloud publisher.
+    pointcloud_pub_ =
+        this->create_publisher<sensor_msgs::msg::PointCloud2>(camera_topic_ + "/depth/points", 10);
   }
 
-  /**
-   * Get the value of the device ID parameter.
-   *
-   * @return The serial number of the Kinect v2 device to use.
-   */
-  string get_device_id() { return _device_id; }
-
-  /**
-   * Get the value of the registration parameter.
-   *
-   * @return Whether to register the depth image to the color image.
-   */
-  bool get_registration() { return _registration; }
-
-  /**
-   * Get the value of the upscale depth parameter.
-   *
-   * @return Whether to upscale the depth image to the resolution of the color image.
-   */
-  bool get_upscale_depth() { return _upscale_depth; }
-
-  /**
-   * Publish a color image from an OpenCV Mat. This will also compress the image if the
-   * compress_color parameter is set to true.
-   *
-   * @param[in] color The color image.
-   */
-  void publish_color(Mat color)
-  {
-    std_msgs::msg::Header header;
-    if (_compress_color) {
-      auto msg = cv_bridge::CvImage(header, "bgr8", color).toCompressedImageMsg(cv_bridge::PNG);
-      _color_pub_compressed->publish(*msg);
-    } else {
-      auto msg = cv_bridge::CvImage(header, "bgr8", color).toImageMsg();
-      _color_pub_uncompressed->publish(*msg);
+  // Initialize the Kinect.
+  if (device_id_.empty()) {
+    device_id_ = getDefaultDeviceSerialNumber();
+    if (device_id_.empty()) {
+      RCLCPP::ERROR(logger, "No Kinect found");
+      return;
     }
   }
-
-  /**
-   * Publish a depth image from an OpenCV Mat.
-   *
-   * @param[in] depth The depth image.
-   */
-  void publish_depth(Mat depth)
-  {
-    std_msgs::msg::Header header;
-    auto msg = cv_bridge::CvImage(header, "32FC1", depth).toImageMsg();
-    _depth_pub->publish(*msg);
+  device_ = freenect2_.openDevice(device_id_);
+  if (device_ == nullptr) {
+    RCLCPP::ERROR(logger, "Failed to open Kinect");
+    return;
   }
 
-private:
-  rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr _color_pub_compressed;
+  // Setup the frame listener.
+  listener_ = new SyncMultiFrameListener(Frame::Color | Frame::Depth);
+  device_->setColorFrameListener(listener_);
+  device_->setIrAndDepthFrameListener(listener_);
 
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr _color_pub_uncompressed;
-
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr _depth_pub;
-
-  string _device_id;
-  bool _registration;
-  bool _compress_color;
-  bool _upscale_depth;
-};
-
-int main(int argc, char** argv)
-{
-  rclcpp::init(argc, argv);
-
-  // Create the node but don't start it yet.
-  auto node = make_shared<Kinect2ROS>();
-
-  // Grab the device ID and registration parameters.
-  string device_id = node->get_device_id();
-  bool enable_depth = node->get_registration();
-  bool upscale_depth = node->get_upscale_depth();
-
-  libfreenect2::Freenect2 freenect2;
-
-  // If no device ID was specified, get the default device.
-  if (device_id.empty()) {
-    RCLCPP_INFO(node->get_logger(), "No device ID specified, using default device.");
-    device_id = freenect2.getDefaultDeviceSerialNumber();
-    if (device_id.empty()) {
-      RCLCPP_ERROR(node->get_logger(), "No devices are connected.");
-      return 1;
-    }
-  }
-
-  // Try to open the device.
-  RCLCPP_INFO(node->get_logger(), "Using device with serial number %s.", device_id.c_str());
-  auto device = freenect2.openDevice(device_id);
-  if (device == nullptr) {
-    RCLCPP_ERROR(node->get_logger(), "Failed to open device.");
-    return 1;
-  }
-
-  // Set up signal handlers.
-  signal(SIGINT, sigint_handler);
-  should_shutdown = false;
-
-  // Set up listeners. If we are registering the depth image, we need to listen to both color
-  // and depth frames. Otherwise, we only need to listen to color frames.
-  libfreenect2::SyncMultiFrameListener listener(enable_depth ? libfreenect2::Frame::Color |
-                                                                   libfreenect2::Frame::Depth :
-                                                               libfreenect2::Frame::Color);
-
-  // Register the listeners with the device.
-  device->setColorFrameListener(&listener);
-  if (enable_depth) device->setIrAndDepthFrameListener(&listener);
+  // Setup registration if pointcloud is enabled.
+  if (enable_pointcloud_)
+    registration_ = new Registration(device_->getIrCameraParams(), device_->getColorCameraParams());
 
   // Start the device.
-  if (!device->start()) {
-    RCLCPP_ERROR(node->get_logger(), "Failed to start device.");
-    return 1;
-  }
-  RCLCPP_INFO(node->get_logger(), "Device %s started with firmware version %s.", device_id.c_str(),
-              device->getFirmwareVersion());
+  device_->start();
+  RCLCPP_INFO(logger, "Kinect started");
+}
 
-  // Setup frame buffers.
-  libfreenect2::FrameMap frames;
-  libfreenect2::Frame undistorted(512, 424, 4), registered(512, 424, 4),
-      depth_upscaled(1920, 1080 + 2, 4);
-  Mat color_mat, depth_mat;
+//                                                                                                //
+// ========================================= Destructor ========================================= //
+//                                                                                                //
 
-  // Setup registration if necessary.
-  libfreenect2::Registration* registration = nullptr;
-  if (enable_depth) {
-    // IR camera params are the same as depth camera params.
-    registration =
-        new libfreenect2::Registration(device->getIrCameraParams(), device->getColorCameraParams());
-  }
+Kinect2RosNode::~Kinect2RosNode()
+{
+  listener_->release();
+  device_->stop();
+  device_->close();
 
-  // Main loop. Keep publishing images until we receive SIGINT.
-  while (!should_shutdown) {
-    // If there is no new frame, spin and check again.
-    if (!listener.hasNewFrame()) {
-      rclcpp::spin_some(node);
-      continue;
-    }
+  delete device_;
+  delete listener_;
+  delete registration_;
+}
 
-    // Receive the frame. A frame is available, so this will not block.
-    listener.waitForNewFrame(frames);
-    auto color_frame = frames[libfreenect::Frame::Color];
+//                                                                                                //
+// ========================================== is_okay =========================================== //
+//                                                                                                //
 
-    // Handle the case where we do not register the depth data. Here, we remove the depth
-    // channel from the color image and publish it directly.
-    if (!enable_depth) {
-      cv::Mat(color_frame->height, color_frame->width, CV_8UC4, color_frame->data)
-          .copyTo(color_mat);
-      cv::cvtColor(color_mat, color_mat, cv::COLOR_BGRA2BGR);  // Remove depth channel.
-      node->publish_color(color_mat);
-    }
+bool Kinect2RosNode::is_okay()
+{
+  if (device_ == nullptr) return false;
+  if (listener_ == nullptr) return false;
+  if (enable_pointcloud_ || registration_ == nullptr) return false;
+  return true;
+}
 
-    // Handle the case where we are registering but not upscaling the depth data. Here, we
-    // register the depth data to the color data and publish the result.
-    else if (enable_depth && !upscale_depth) {
-      // Register depth to color.
-      auto depth_frame = frames[libfreenect::Frame::Depth];
-      registration->apply(color_frame, depth_frame, &undistorted, &registered, true, nullptr);
+//                                                                                                //
+// =========================================== update =========================================== //
+//                                                                                                //
 
-      // Convert registered color pixels to OpenCV Mat and publish.
-      cv::Mat(registered.height, registered.width, CV_8UC4, registered.data).copyTo(color_mat);
-      cv::cvtColor(color_mat, color_mat, cv::COLOR_BGRA2BGR);  // Remove depth channel.
-      node->publish_color(color_mat);
-
-      // Convert depth pixels to OpenCV Mat and publish.
-      cv::Mat(registered.height, registered.width, CV_32FC1, registered.data).copyTo(depth_mat);
-      node->publish_depth(depth_mat);
-    }
-
-    // Handle the case where we are registering and upscaling the depth data. Here, we
-    // register the depth data to the color data, upscale the depth data, and publish both.
-    else if (enable_depth && upscale_depth) {
-      // Register depth to color.
-      auto depth_frame = frames[libfreenect::Frame::Depth];
-      registration->apply(color_frame, depth_frame, &undistorted, &registered, true,
-                          &depth_upscaled);
-
-      // Convert original color pixels to OpenCV Mat and publish.
-      cv::Mat(color_frame->height, color_frame->width, CV_8UC4, color_frame->data)
-          .copyTo(color_mat);
-      cv::cvtColor(color_mat, color_mat, cv::COLOR_BGRA2BGR);  // Remove depth channel.
-      node->publish_color(color_mat);
-
-      // Convert upscaled depth pixels to OpenCV Mat and publish.
-      cv::Mat(depth_upscaled.height, depth_upscaled.width, CV_32FC1, depth_upscaled.data)
-          .copyTo(depth_mat);
-      node->publish_depth(depth_mat);
-    }
+bool Kinect2RosNode::update(int timeout)
+{
+  if (!is_okay()) {
+    RCLCPP_ERROR(this->get_logger(), "Cannot update; node is not healthy");
+    return false;
   }
 
-  // Release resources.
-  listener.release(frames);
-  device->stop();
-  device->close();
-  delete registration;
+  // Receive frames from Kinect.
+  if (!listener_->waitForNewFrame(frames_, timeout)) {
+    RCLCPP_ERROR(this->get_logger(), "Timeout when receiving frame from Kinect");
+    return false;
+  }
+  rclcpp::Time now = this->get_clock()->now();
 
-  RCLCPP_INFO(node->get_logger(), "Kinect has been disconnected cleanly.");
+  Frame* color_frame = frames_[Frame::Color];
+  Frame* depth_frame = frames_[Frame::Depth];
 
-  rclcpp::shutdown();
+  // Convert color frame to OpenCV mat.
+  cv::Mat color_mat_rgba(color_frame->height, color_frame->width, CV_8UC4, color_frame->data);
+  static cv::Mat color_mat_rgb(color_frame->height, color_frame->width, CV_8UC3);
+  cv::cvtColor(color_mat_rgba, color_mat_rgb, cv::COLOR_RGBA2RGB);
+  static cv::Mat color_mat_flipped(color_frame->height, color_frame->width, CV_8UC3);
+  cv::flip(color_mat_rgb, color_mat_flipped, 1);
+
+  // Convert depth frame to OpenCV mat.
+  cv::Mat depth_mat(depth_frame->height, depth_frame->width, CV_8UC4, depth_frame->data);
+  static cv::Mat depth_mat_flipped(depth_frame->height, depth_frame->width, CV_32FC1);
+  cv::flip(depth_mat, depth_mat_flipped, 1);
+
+  // Create Image messages.
+  color_msg_ = mat_to_msg(color_mat_flipped, "8UC3");
+  depth_msg_ = mat_to_msg(depth_mat_flipped, "32FC1");
+
+  // Create CameraInfo messages.
+  sensor_msgs::msg::CameraInfo::SharedPtr color_cinfo_msg(
+      new sensor_msgs::msg::CameraInfo(color_cinfo_manager_->getCameraInfo()));
+  sensor_msgs::msg::CameraInfo::SharedPtr depth_cinfo_msg(
+      new sensor_msgs::msg::CameraInfo(depth_cinfo_manager_->getCameraInfo()));
+
+  // Set the frame ID and timestamp for the messages.
+  color_msg_->header.frame_id = color_frame_;
+  color_msg_->header.stamp = now;
+  color_cinfo_msg->header.frame_id = color_frame_;
+  color_cinfo_msg->header.stamp = now;
+  depth_msg_->header.frame_id = depth_frame_;
+  depth_msg_->header.stamp = now;
+  depth_cinfo_msg->header.frame_id = depth_frame_;
+  depth_cinfo_msg->header.stamp = now;
+
+  // Publish images and camera info.
+  color_cinfo_pub_.publish(color_msg_, color_cinfo_msg);
+  depth_cinfo_pub_.publish(depth_msg_, depth_cinfo_msg);
+
+  if (enable_pointcloud_) {
+    // Apply registration.
+    registration_->apply(color_frame, depth_frame, undistorted_, registered_, filter_pointcloud_,
+                         nullptr);
+    cv::Mat undistorted_mat(undistorted_->height, undistorted_->width, CV_32FC1,
+                            undistorted_->data);
+
+    // Construct pointcloud.
+    pointcloud_msg_->header.stamp = now;
+    auto data = pointcloud_msg_->data;
+    data.clear();
+    data.reserve(undistorted_mat->rows * undistorted_mat->cols);
+    for (size_t row = 0; row < undistorted_mat->rows; ++row) {
+      for (size_t col = 0; col < undistorted_mat->cols; ++col) {
+        // Filter invalid points.
+        if (filter_pointcloud_) {
+          float pixel = undistorted_mat.at<float>(row, col);
+          if (isnan(pixel) || isinf(pixel) || pixel < 0) continue;
+        }
+
+        // Calculate point.
+        float x;
+        float y;
+        float z;
+        float rgb;
+        registration_->getPointXYZRGB(undistorted_, registered_, row, col, x, y, z, rgb);
+
+        // Add to cloud.
+        char new_point[15];
+        memcpy(&new_point[0], &x, 4);
+        memcpy(&new_point[4], &y, 4);
+        memcpy(&new_point[8], &z, 4);
+        memcpy(&new_point[12], &rgb, 3);
+        data.insert(data.end(), begin(new_point), end(new_point));
+      }
+    }
+
+    // Publish pointcloud.
+    pointcloud_pub_->publish(pointcloud_msg_);
+  }
+
+  // Release frames from the frame buffer.
+  listener_->release(frames_);
+}
+
+//                                                                                                //
+// ===================================== create_point_field ===================================== //
+//                                                                                                //
+
+sensor_msgs::msg::PointField Kinect2RosNode::create_point_field(const std::string& name,
+                                                                const uint32_t offset,
+                                                                const uint8_t datatype,
+                                                                const uint32_t count)
+{
+  sensor_msgs::msg::PointField field;
+  field.name = name;
+  field.offset = offset;
+  field.datatype = datatype;
+  field.count = count;
+  return field;
+}
+
+//                                                                                                //
+// ========================================= mat_to_msg ========================================= //
+//                                                                                                //
+
+std::shared_ptr<sensor_msgs::msg::Image> Kinect2RosNode::mat_to_msg(cv::Mat& frame,
+                                                                    std::string encoding)
+{
+  std_msgs::msg::Header header;
+  sensor_msgs::msg::Image image;
+
+  image.header = header;
+  image.height = frame.rows;
+  image.width = frame.cols;
+  image.encoding = encoding;
+  image.is_bigendian = IS_BIGENDIAN;
+  image.step = frame.cols * frame.elemSize();
+  size_t size = image.step * frame.rows;
+  image.data.resize(size);
+
+  if (frame.isContinuous())
+    memcpy(reinterpret_cast<uint8_t*>(&image.data[0]), frame.data, size);
+  else {
+    uint8_t* image_data = reinterpret_cast<uint8_t*>(&image.data[0]);
+    uint8_t* frame_data = frame.data;
+    for (int i = 0; i < frame.rows; ++i) {
+      memcpy(image_data, frame_data, image.step);
+      image_data += image.step;
+      frame_data += frame.step;
+    }
+  }
+
+  return std::make_shared<sensor_msgs::msg::Image>(image);
 }

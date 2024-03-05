@@ -25,8 +25,10 @@ target_compile_features(kinect2ros PUBLIC c_std_99 cxx_std_17)  # Require C99 an
 
 target_link_libraries(kinect2ros ${OpenCV_LIBS} ${freenect2_LIBRARIES})
 
-install(TARGETS kinect2ros
-  DESTINATION lib/${PROJECT_NAME})
+install(TARGETS kinect2ros DESTINATION lib/${PROJECT_NAME})
+
+
+install(DIRECTORY camera_calibration DESTINATION share/${PROJECT_NAME})
 
 
 ament_package()
