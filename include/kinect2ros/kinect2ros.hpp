@@ -1,7 +1,9 @@
 #ifndef KINECT2ROS__KINECT2ROS_HPP_
 #define KINECT2ROS__KINECT2ROS_HPP_
 
+#include <libfreenect2/frame_listener_impl.h>
 #include <libfreenect2/libfreenect2.hpp>
+#include <libfreenect2/registration.h>
 
 #include "camera_info_manager/camera_info_manager.hpp"
 #include "image_transport/image_transport.hpp"
@@ -89,8 +91,8 @@ private:
   libfreenect2::Registration* registration_ = nullptr;
 
   libfreenect2::FrameMap frames_;
-  libfreenect2::Frame undistorted_(DEPTH_WIDTH, DEPTH_HEIGHT, 4);
-  libfreenect2::Frame registered_(DEPTH_WIDTH, DEPTH_HEIGHT, 4);
+  libfreenect2::Frame* undistorted_;
+  libfreenect2::Frame* registered_;
 
   std::shared_ptr<camera_info_manager::CameraInfoManager> color_cinfo_manager_;
   std::shared_ptr<camera_info_manager::CameraInfoManager> depth_cinfo_manager_;

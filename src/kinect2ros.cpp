@@ -1,5 +1,7 @@
 #include "kinect2ros/kinect2ros.hpp"
 
+#include "opencv2/opencv.hpp"
+
 using namespace std::chrono_literals;
 using namespace camera_info_manager;
 using namespace libfreenect2;
@@ -56,9 +58,9 @@ Kinect2RosNode::Kinect2RosNode(const rclcpp::NodeOptions& node_options)
     pointcloud_msg_->fields.emplace_back(
         create_point_field("z", 8, sensor_msgs::msg::PointField::FLOAT32, 1));
     pointcloud_msg_->fields.emplace_back(
-        create_point_field("rgb", 12, sensor_msgs::msg::PointField::UINT8, 3));
+        create_point_field("rgb", 12, sensor_msgs::msg::PointField::FLOAT32, 1));
     pointcloud_msg_->is_bigendian = IS_BIGENDIAN;
-    pointcloud_msg_->point_step = (4 * 3) + (1 * 3);  // 3 floats, 3 uint8s
+    pointcloud_msg_->point_step = 16;
     pointcloud_msg_->row_step = pointcloud_msg_->point_step * DEPTH_WIDTH;
     pointcloud_msg_->data.reserve(pointcloud_msg_->row_step * DEPTH_HEIGHT);
     pointcloud_msg_->is_dense = !filter_pointcloud_;
@@ -70,15 +72,15 @@ Kinect2RosNode::Kinect2RosNode(const rclcpp::NodeOptions& node_options)
 
   // Initialize the Kinect.
   if (device_id_.empty()) {
-    device_id_ = getDefaultDeviceSerialNumber();
+    device_id_ = freenect2_.getDefaultDeviceSerialNumber();
     if (device_id_.empty()) {
-      RCLCPP::ERROR(logger, "No Kinect found");
+      RCLCPP_ERROR(logger, "No Kinect found");
       return;
     }
   }
   device_ = freenect2_.openDevice(device_id_);
   if (device_ == nullptr) {
-    RCLCPP::ERROR(logger, "Failed to open Kinect");
+    RCLCPP_ERROR(logger, "Failed to open Kinect");
     return;
   }
 
@@ -86,6 +88,8 @@ Kinect2RosNode::Kinect2RosNode(const rclcpp::NodeOptions& node_options)
   listener_ = new SyncMultiFrameListener(Frame::Color | Frame::Depth);
   device_->setColorFrameListener(listener_);
   device_->setIrAndDepthFrameListener(listener_);
+  undistorted_ = new Frame(DEPTH_WIDTH, DEPTH_HEIGHT, 4);
+  registered_ = new Frame(DEPTH_WIDTH, DEPTH_HEIGHT, 4);
 
   // Setup registration if pointcloud is enabled.
   if (enable_pointcloud_)
@@ -102,13 +106,15 @@ Kinect2RosNode::Kinect2RosNode(const rclcpp::NodeOptions& node_options)
 
 Kinect2RosNode::~Kinect2RosNode()
 {
-  listener_->release();
+  listener_->release(frames_);
   device_->stop();
   device_->close();
 
   delete device_;
   delete listener_;
   delete registration_;
+  delete undistorted_;
+  delete registered_;
 }
 
 //                                                                                                //
@@ -119,7 +125,7 @@ bool Kinect2RosNode::is_okay()
 {
   if (device_ == nullptr) return false;
   if (listener_ == nullptr) return false;
-  if (enable_pointcloud_ || registration_ == nullptr) return false;
+  if (enable_pointcloud_ && registration_ == nullptr) return false;
   return true;
 }
 
@@ -184,45 +190,32 @@ bool Kinect2RosNode::update(int timeout)
     // Apply registration.
     registration_->apply(color_frame, depth_frame, undistorted_, registered_, filter_pointcloud_,
                          nullptr);
-    cv::Mat undistorted_mat(undistorted_->height, undistorted_->width, CV_32FC1,
-                            undistorted_->data);
 
     // Construct pointcloud.
     pointcloud_msg_->header.stamp = now;
-    auto data = pointcloud_msg_->data;
-    data.clear();
-    data.reserve(undistorted_mat->rows * undistorted_mat->cols);
-    for (size_t row = 0; row < undistorted_mat->rows; ++row) {
-      for (size_t col = 0; col < undistorted_mat->cols; ++col) {
-        // Filter invalid points.
-        if (filter_pointcloud_) {
-          float pixel = undistorted_mat.at<float>(row, col);
-          if (isnan(pixel) || isinf(pixel) || pixel < 0) continue;
-        }
-
+    auto data = &pointcloud_msg_->data;
+    data->clear();
+    data->reserve(undistorted_->height * undistorted_->width);
+    for (size_t row = 0; row < undistorted_->height; ++row) {
+      for (size_t col = 0; col < undistorted_->width; ++col) {
         // Calculate point.
-        float x;
-        float y;
-        float z;
-        float rgb;
-        registration_->getPointXYZRGB(undistorted_, registered_, row, col, x, y, z, rgb);
+        float new_point[4];
+        registration_->getPointXYZRGB(undistorted_, registered_, row, col, new_point[0],
+                                      new_point[1], new_point[2], new_point[3]);
+        // if (filter_pointcloud_ && (isnan(x) || isnan(y) || isnan(z))) continue;
 
         // Add to cloud.
-        char new_point[15];
-        memcpy(&new_point[0], &x, 4);
-        memcpy(&new_point[4], &y, 4);
-        memcpy(&new_point[8], &z, 4);
-        memcpy(&new_point[12], &rgb, 3);
-        data.insert(data.end(), begin(new_point), end(new_point));
+        data->insert(data->end(), new_point, new_point + 16);
       }
     }
 
     // Publish pointcloud.
-    pointcloud_pub_->publish(pointcloud_msg_);
+    pointcloud_pub_->publish(*pointcloud_msg_);
   }
 
   // Release frames from the frame buffer.
   listener_->release(frames_);
+  return true;
 }
 
 //                                                                                                //
