@@ -35,8 +35,10 @@ Kinect2RosNode::Kinect2RosNode(const rclcpp::NodeOptions& node_options)
   auto logger = this->get_logger();
 
   // Create the image transport publishers.
-  color_cinfo_pub_ = image_transport::create_camera_publisher(this, camera_topic_ + "/color/image_raw");
-  depth_cinfo_pub_ = image_transport::create_camera_publisher(this, camera_topic_ + "/depth/image_raw");
+  color_cinfo_pub_ =
+      image_transport::create_camera_publisher(this, camera_topic_ + "/color/image_raw");
+  depth_cinfo_pub_ =
+      image_transport::create_camera_publisher(this, camera_topic_ + "/depth/image_raw");
   ir_cinfo_pub_ = image_transport::create_camera_publisher(this, camera_topic_ + "/ir/image_raw");
 
   // Create the camera info managers.
@@ -64,7 +66,7 @@ Kinect2RosNode::Kinect2RosNode(const rclcpp::NodeOptions& node_options)
     pointcloud_msg_->point_step = 16;
     pointcloud_msg_->row_step = pointcloud_msg_->point_step * DEPTH_WIDTH;
     pointcloud_msg_->data.reserve(pointcloud_msg_->row_step * DEPTH_HEIGHT);
-    pointcloud_msg_->is_dense = !filter_pointcloud_;
+    pointcloud_msg_->is_dense = false;
 
     // Create the pointcloud publisher.
     pointcloud_pub_ =
@@ -149,7 +151,6 @@ bool Kinect2RosNode::update(int timeout)
     return false;
   }
   rclcpp::Time now = this->get_clock()->now();
-
   Frame* color_frame = frames_[Frame::Color];
   Frame* depth_frame = frames_[Frame::Depth];
   Frame* ir_frame = frames_[Frame::Ir];
@@ -216,7 +217,7 @@ bool Kinect2RosNode::update(int timeout)
                                       new_point[1], new_point[2], new_point[3]);
 
         // Add to cloud.
-        uint8_t* new_point_u8 = reinterpret_cast<uint8_t*>(new_point);
+        const uint8_t* new_point_u8 = reinterpret_cast<uint8_t*>(new_point);
         data->insert(data->end(), new_point_u8, new_point_u8 + 16);
       }
     }

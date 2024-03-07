@@ -2,8 +2,9 @@
 #define KINECT2ROS__KINECT2ROS_HPP_
 
 #include <libfreenect2/frame_listener_impl.h>
-#include <libfreenect2/libfreenect2.hpp>
 #include <libfreenect2/registration.h>
+
+#include <libfreenect2/libfreenect2.hpp>
 
 #include "camera_info_manager/camera_info_manager.hpp"
 #include "image_transport/image_transport.hpp"
