@@ -1,0 +1,72 @@
+kinect2ros:
+  device_id:
+    {
+      type: string,
+      default_value: "",
+      description:
+        "The device ID (serial number) of the Kinect2. If left empty, the first device found will be
+        used.",
+    }
+
+  color_frame:
+    {
+      type: string,
+      default_value: "kinect2_color_optical_frame",
+      description: "The TF2 frame_id of the color camera.",
+    }
+
+  depth_frame:
+    {
+      type: string,
+      default_value: "kinect2_depth_optical_frame",
+      description: "The TF2 frame_id of the depth camera.",
+    }
+
+  base_topic:
+    {
+      type: string,
+      default_value: "kinect2",
+      description:
+        "The base topic for the Kinect2. Image topics will be <base_topic>/color/image_raw,
+        <base_topic>/depth/image_raw, etc. Pointcloud will be <base_topic>/points.",
+    }
+
+  point_cloud:
+    enabled: { type: bool, default_value: true, description: "Whether to publish a point cloud." }
+    filter:
+      {
+        type: bool,
+        default_value: true,
+        description:
+          "Whether to filter out points that cannot be seen by both the color and depth cameras.",
+      }
+
+  calibration_files:
+    color:
+      {
+        type: string,
+        default_value: "package://kinect2ros/camera_calibration/color/ost.yaml",
+        description: "The path to the color camera calibration file.",
+      }
+    depth:
+      {
+        type: string,
+        default_value: "package://kinect2ros/camera_calibration/depth/ost.yaml",
+        description: "The path to the depth camera calibration file.",
+      }
+
+  transform:
+    enabled:
+      {
+        type: bool,
+        default_value: true,
+        description: "Whether to publish the transform between the color and depth camera frames.",
+      }
+    translation:
+      {
+        type: [double, double, double],
+        default_value: [-0.06015, 0.00221, 0.02714],
+        description:
+          "The translation between the color and depth camera frames. Default value is from
+          DOI:10.3390/ijgi6110349",
+      }

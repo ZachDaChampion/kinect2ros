@@ -14,8 +14,17 @@ find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(image_transport REQUIRED)
 find_package(camera_info_manager REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs  REQUIRED)
+find_package(generate_parameter_library REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS highgui imgcodecs imgproc videoio)
 find_package(freenect2 REQUIRED)
+
+generate_parameter_library(
+  kinect2ros_params
+  src/parameters.yaml
+)
 
 add_executable(kinect2ros src/kinect2ros.cpp src/main.cpp)
 
@@ -24,6 +33,9 @@ ament_target_dependencies(kinect2ros
   std_msgs
   sensor_msgs
   image_transport
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
   camera_info_manager
 )
 
@@ -39,6 +51,7 @@ target_compile_features(kinect2ros PUBLIC c_std_99 cxx_std_17)  # Require C99 an
 target_link_libraries(kinect2ros
   ${OpenCV_LIBS}
   ${freenect2_LIBRARIES}
+  kinect2ros_params
 )
 
 install(TARGETS kinect2ros DESTINATION lib/${PROJECT_NAME})

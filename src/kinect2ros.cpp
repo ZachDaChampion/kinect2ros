@@ -14,43 +14,48 @@ static const bool IS_BIGENDIAN = false;  // TODO: Determine this programmaticall
 //                                                                                                //
 
 Kinect2RosNode::Kinect2RosNode(const rclcpp::NodeOptions& node_options)
-  : Node("kinect2ros", node_options)
 {
-  // Declare parameters
-  color_frame_ = this->declare_parameter<string>("color_frame", "kinect_color_frame");
-  depth_frame_ = this->declare_parameter<string>("depth_frame", "kinect_depth_frame");
-  camera_topic_ = this->declare_parameter<string>("camera_topic", "kinect");
-  device_id_ = this->declare_parameter<string>("device_id", "");
-  enable_pointcloud_ = this->declare_parameter<bool>("enable_pointcloud_", true);
-  filter_pointcloud_ = this->declare_parameter<bool>("filter_pointcloud_", true);
-  auto color_calibration_file = this->declare_parameter<string>("color_calibration_file",
-                                                                "package://kinect2ros/"
-                                                                "camera_calibration/"
-                                                                "color/ost.yaml");
-  auto depth_calibration_file = this->declare_parameter<string>("depth_calibration_file",
-                                                                "package://kinect2ros/"
-                                                                "camera_calibration/"
-                                                                "depth/ost.yaml");
+  node = rclcpp::Node::make_shared("kinect2ros", node_options);
+  param_listener_ = make_unique<ParamListener>(node);
+  params_ = make_unique<Params>(param_listener_->get_params());
 
-  auto logger = this->get_logger();
+  // Publish static transform if enabled.
+  if (params_->transform.enabled) {
+    static_tf_broadcaster_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(node);
+    geometry_msgs::msg::TransformStamped t;
+    t.header.stamp = node->get_clock()->now();
+    t.header.frame_id = params_->depth_frame;
+    t.child_frame_id = params_->color_frame;
+    t.transform.translation.x = params_->transform.translation[0];
+    t.transform.translation.y = params_->transform.translation[1];
+    t.transform.translation.z = params_->transform.translation[2];
+    t.transform.rotation.x = 0;
+    t.transform.rotation.y = 0;
+    t.transform.rotation.z = 0;
+    t.transform.rotation.w = 1;
+    static_tf_broadcaster_->sendTransform(t);
+  }
 
   // Create the image transport publishers.
-  color_cinfo_pub_ =
-      image_transport::create_camera_publisher(this, camera_topic_ + "/color/image_raw");
-  depth_cinfo_pub_ =
-      image_transport::create_camera_publisher(this, camera_topic_ + "/depth/image_raw");
-  ir_cinfo_pub_ = image_transport::create_camera_publisher(this, camera_topic_ + "/ir/image_raw");
+  color_cinfo_pub_ = image_transport::create_camera_publisher(node, params_->base_topic +
+                                                                        "/color/"
+                                                                        "image_raw");
+  depth_cinfo_pub_ = image_transport::create_camera_publisher(node, params_->base_topic +
+                                                                        "/depth/"
+                                                                        "image_raw");
+  ir_cinfo_pub_ =
+      image_transport::create_camera_publisher(node, params_->base_topic + "/ir/image_raw");
 
   // Create the camera info managers.
-  color_cinfo_manager_ = std::make_shared<CameraInfoManager>(this);
-  depth_cinfo_manager_ = std::make_shared<CameraInfoManager>(this);
-  color_cinfo_manager_->loadCameraInfo(color_calibration_file);
-  depth_cinfo_manager_->loadCameraInfo(depth_calibration_file);
+  color_cinfo_manager_ = std::make_shared<CameraInfoManager>(node);
+  depth_cinfo_manager_ = std::make_shared<CameraInfoManager>(node);
+  color_cinfo_manager_->loadCameraInfo(params_->calibration_files.color);
+  depth_cinfo_manager_->loadCameraInfo(params_->calibration_files.depth);
 
   if (enable_pointcloud_) {
     // Initialize the pointcloud message with 4 fields (x, y, z, rgb).
     pointcloud_msg_ = std::make_shared<sensor_msgs::msg::PointCloud2>();
-    pointcloud_msg_->header.frame_id = depth_frame_;
+    pointcloud_msg_->header.frame_id = params->depth_frame;
     pointcloud_msg_->height = DEPTH_HEIGHT;
     pointcloud_msg_->width = DEPTH_WIDTH;
     pointcloud_msg_->fields.reserve(4);
@@ -70,18 +75,19 @@ Kinect2RosNode::Kinect2RosNode(const rclcpp::NodeOptions& node_options)
 
     // Create the pointcloud publisher.
     pointcloud_pub_ =
-        this->create_publisher<sensor_msgs::msg::PointCloud2>(camera_topic_ + "/depth/points", 10);
+        node->create_publisher<sensor_msgs::msg::PointCloud2>(params_->base_topic + "/points", 10);
   }
 
   // Initialize the Kinect.
-  if (device_id_.empty()) {
-    device_id_ = freenect2_.getDefaultDeviceSerialNumber();
-    if (device_id_.empty()) {
+  string device_id = params_->device_id;
+  if (device_id.empty()) {
+    device_id = freenect2_.getDefaultDeviceSerialNumber();
+    if (device_id.empty()) {
       RCLCPP_ERROR(logger, "No Kinect found");
       return;
     }
   }
-  device_ = freenect2_.openDevice(device_id_);
+  device_ = freenect2_.openDevice(device_id);
   if (device_ == nullptr) {
     RCLCPP_ERROR(logger, "Failed to open Kinect");
     return;
@@ -99,7 +105,7 @@ Kinect2RosNode::Kinect2RosNode(const rclcpp::NodeOptions& node_options)
   RCLCPP_INFO(logger, "Kinect started");
 
   // Setup registration if pointcloud is enabled.
-  if (enable_pointcloud_) {
+  if (params_->point_cloud.enabled) {
     registration_ = new Registration(device_->getIrCameraParams(), device_->getColorCameraParams());
     RCLCPP_INFO(logger, "Registration initialized");
   }
@@ -130,7 +136,7 @@ bool Kinect2RosNode::is_okay()
 {
   if (device_ == nullptr) return false;
   if (listener_ == nullptr) return false;
-  if (enable_pointcloud_ && registration_ == nullptr) return false;
+  if (params_->point_cloud.enabled && registration_ == nullptr) return false;
   return true;
 }
 
@@ -184,15 +190,15 @@ bool Kinect2RosNode::update(int timeout)
       new sensor_msgs::msg::CameraInfo(depth_cinfo_manager_->getCameraInfo()));
 
   // Set the frame ID and timestamp for the messages.
-  color_msg_->header.frame_id = color_frame_;
+  color_msg_->header.frame_id = params_->color_frame;
   color_msg_->header.stamp = now;
-  color_cinfo_msg->header.frame_id = color_frame_;
+  color_cinfo_msg->header.frame_id = params_->color_frame;
   color_cinfo_msg->header.stamp = now;
-  depth_msg_->header.frame_id = depth_frame_;
+  depth_msg_->header.frame_id = params_->depth_frame;
   depth_msg_->header.stamp = now;
-  depth_cinfo_msg->header.frame_id = depth_frame_;
+  depth_cinfo_msg->header.frame_id = params_->depth_frame;
   depth_cinfo_msg->header.stamp = now;
-  ir_msg_->header.frame_id = depth_frame_;
+  ir_msg_->header.frame_id = params_->depth_frame;
   ir_msg_->header.stamp = now;
 
   // Publish images and camera info.
