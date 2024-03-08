@@ -99,10 +99,12 @@ private:
 
   image_transport::CameraPublisher color_cinfo_pub_;
   image_transport::CameraPublisher depth_cinfo_pub_;
+  image_transport::CameraPublisher ir_cinfo_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_pub_;
 
   std::shared_ptr<sensor_msgs::msg::Image> color_msg_;
   std::shared_ptr<sensor_msgs::msg::Image> depth_msg_;
+  std::shared_ptr<sensor_msgs::msg::Image> ir_msg_;
   std::shared_ptr<sensor_msgs::msg::PointCloud2> pointcloud_msg_;
 };
 

@@ -25,18 +25,19 @@ Kinect2RosNode::Kinect2RosNode(const rclcpp::NodeOptions& node_options)
   filter_pointcloud_ = this->declare_parameter<bool>("filter_pointcloud_", true);
   auto color_calibration_file = this->declare_parameter<string>("color_calibration_file",
                                                                 "package://kinect2ros/"
-                                                                "color_camera_calibration/"
-                                                                "ost.yaml");
+                                                                "camera_calibration/"
+                                                                "color/ost.yaml");
   auto depth_calibration_file = this->declare_parameter<string>("depth_calibration_file",
                                                                 "package://kinect2ros/"
-                                                                "depth_camera_calibration/"
-                                                                "ost.yaml");
+                                                                "camera_calibration/"
+                                                                "depth/ost.yaml");
 
   auto logger = this->get_logger();
 
   // Create the image transport publishers.
-  color_cinfo_pub_ = image_transport::create_camera_publisher(this, camera_topic_ + "/color/image");
-  depth_cinfo_pub_ = image_transport::create_camera_publisher(this, camera_topic_ + "/depth/image");
+  color_cinfo_pub_ = image_transport::create_camera_publisher(this, camera_topic_ + "/color/image_raw");
+  depth_cinfo_pub_ = image_transport::create_camera_publisher(this, camera_topic_ + "/depth/image_raw");
+  ir_cinfo_pub_ = image_transport::create_camera_publisher(this, camera_topic_ + "/ir/image_raw");
 
   // Create the camera info managers.
   color_cinfo_manager_ = std::make_shared<CameraInfoManager>(this);
@@ -85,19 +86,21 @@ Kinect2RosNode::Kinect2RosNode(const rclcpp::NodeOptions& node_options)
   }
 
   // Setup the frame listener.
-  listener_ = new SyncMultiFrameListener(Frame::Color | Frame::Depth);
+  listener_ = new SyncMultiFrameListener(Frame::Color | Frame::Depth | Frame::Ir);
   device_->setColorFrameListener(listener_);
   device_->setIrAndDepthFrameListener(listener_);
   undistorted_ = new Frame(DEPTH_WIDTH, DEPTH_HEIGHT, 4);
   registered_ = new Frame(DEPTH_WIDTH, DEPTH_HEIGHT, 4);
 
-  // Setup registration if pointcloud is enabled.
-  if (enable_pointcloud_)
-    registration_ = new Registration(device_->getIrCameraParams(), device_->getColorCameraParams());
-
   // Start the device.
   device_->start();
   RCLCPP_INFO(logger, "Kinect started");
+
+  // Setup registration if pointcloud is enabled.
+  if (enable_pointcloud_) {
+    registration_ = new Registration(device_->getIrCameraParams(), device_->getColorCameraParams());
+    RCLCPP_INFO(logger, "Registration initialized");
+  }
 }
 
 //                                                                                                //
@@ -149,6 +152,7 @@ bool Kinect2RosNode::update(int timeout)
 
   Frame* color_frame = frames_[Frame::Color];
   Frame* depth_frame = frames_[Frame::Depth];
+  Frame* ir_frame = frames_[Frame::Ir];
 
   // Convert color frame to OpenCV mat.
   cv::Mat color_mat_rgba(color_frame->height, color_frame->width, CV_8UC4, color_frame->data);
@@ -158,13 +162,19 @@ bool Kinect2RosNode::update(int timeout)
   cv::flip(color_mat_rgb, color_mat_flipped, 1);
 
   // Convert depth frame to OpenCV mat.
-  cv::Mat depth_mat(depth_frame->height, depth_frame->width, CV_8UC4, depth_frame->data);
+  cv::Mat depth_mat(depth_frame->height, depth_frame->width, CV_32FC1, depth_frame->data);
   static cv::Mat depth_mat_flipped(depth_frame->height, depth_frame->width, CV_32FC1);
   cv::flip(depth_mat, depth_mat_flipped, 1);
 
+  // Conver IR frame to OpenCV mat.
+  cv::Mat ir_mat(ir_frame->height, ir_frame->width, CV_32FC1, ir_frame->data);
+  static cv::Mat ir_mat_flipped(ir_frame->height, ir_frame->width, CV_32FC1);
+  cv::flip(ir_mat, ir_mat_flipped, 1);
+
   // Create Image messages.
-  color_msg_ = mat_to_msg(color_mat_flipped, "8UC3");
+  color_msg_ = mat_to_msg(color_mat_flipped, "bgr8");
   depth_msg_ = mat_to_msg(depth_mat_flipped, "32FC1");
+  ir_msg_ = mat_to_msg(ir_mat_flipped, "32FC1");
 
   // Create CameraInfo messages.
   sensor_msgs::msg::CameraInfo::SharedPtr color_cinfo_msg(
@@ -181,15 +191,17 @@ bool Kinect2RosNode::update(int timeout)
   depth_msg_->header.stamp = now;
   depth_cinfo_msg->header.frame_id = depth_frame_;
   depth_cinfo_msg->header.stamp = now;
+  ir_msg_->header.frame_id = depth_frame_;
+  ir_msg_->header.stamp = now;
 
   // Publish images and camera info.
   color_cinfo_pub_.publish(color_msg_, color_cinfo_msg);
   depth_cinfo_pub_.publish(depth_msg_, depth_cinfo_msg);
+  ir_cinfo_pub_.publish(ir_msg_, depth_cinfo_msg);
 
   if (enable_pointcloud_) {
-    // Apply registration.
-    registration_->apply(color_frame, depth_frame, undistorted_, registered_, filter_pointcloud_,
-                         nullptr);
+    // Apply registration to map the color frame onto the depth frame.
+    registration_->apply(color_frame, depth_frame, undistorted_, registered_, filter_pointcloud_);
 
     // Construct pointcloud.
     pointcloud_msg_->header.stamp = now;
@@ -202,10 +214,10 @@ bool Kinect2RosNode::update(int timeout)
         float new_point[4];
         registration_->getPointXYZRGB(undistorted_, registered_, row, col, new_point[0],
                                       new_point[1], new_point[2], new_point[3]);
-        // if (filter_pointcloud_ && (isnan(x) || isnan(y) || isnan(z))) continue;
 
         // Add to cloud.
-        data->insert(data->end(), new_point, new_point + 16);
+        uint8_t* new_point_u8 = reinterpret_cast<uint8_t*>(new_point);
+        data->insert(data->end(), new_point_u8, new_point_u8 + 16);
       }
     }
 
