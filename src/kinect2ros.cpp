@@ -5,6 +5,7 @@
 using namespace std::chrono_literals;
 using namespace camera_info_manager;
 using namespace libfreenect2;
+using namespace kinect2ros;
 using namespace std;
 
 static const bool IS_BIGENDIAN = false;  // TODO: Determine this programmatically
@@ -13,11 +14,12 @@ static const bool IS_BIGENDIAN = false;  // TODO: Determine this programmaticall
 // ======================================== Constructor ========================================= //
 //                                                                                                //
 
-Kinect2RosNode::Kinect2RosNode(const rclcpp::NodeOptions& node_options)
+Kinect2RosNode::Kinect2RosNode()
 {
-  node = rclcpp::Node::make_shared("kinect2ros", node_options);
+  node = rclcpp::Node::make_shared("kinect2ros");
   param_listener_ = make_unique<ParamListener>(node);
   params_ = make_unique<Params>(param_listener_->get_params());
+  auto logger = node->get_logger();
 
   // Publish static transform if enabled.
   if (params_->transform.enabled) {
@@ -37,25 +39,25 @@ Kinect2RosNode::Kinect2RosNode(const rclcpp::NodeOptions& node_options)
   }
 
   // Create the image transport publishers.
-  color_cinfo_pub_ = image_transport::create_camera_publisher(node, params_->base_topic +
+  color_cinfo_pub_ = image_transport::create_camera_publisher(node.get(), params_->base_topic +
                                                                         "/color/"
                                                                         "image_raw");
-  depth_cinfo_pub_ = image_transport::create_camera_publisher(node, params_->base_topic +
+  depth_cinfo_pub_ = image_transport::create_camera_publisher(node.get(), params_->base_topic +
                                                                         "/depth/"
                                                                         "image_raw");
   ir_cinfo_pub_ =
-      image_transport::create_camera_publisher(node, params_->base_topic + "/ir/image_raw");
+      image_transport::create_camera_publisher(node.get(), params_->base_topic + "/ir/image_raw");
 
   // Create the camera info managers.
-  color_cinfo_manager_ = std::make_shared<CameraInfoManager>(node);
-  depth_cinfo_manager_ = std::make_shared<CameraInfoManager>(node);
+  color_cinfo_manager_ = std::make_shared<CameraInfoManager>(node.get());
+  depth_cinfo_manager_ = std::make_shared<CameraInfoManager>(node.get());
   color_cinfo_manager_->loadCameraInfo(params_->calibration_files.color);
   depth_cinfo_manager_->loadCameraInfo(params_->calibration_files.depth);
 
-  if (enable_pointcloud_) {
+  if (params_->point_cloud.enabled) {
     // Initialize the pointcloud message with 4 fields (x, y, z, rgb).
     pointcloud_msg_ = std::make_shared<sensor_msgs::msg::PointCloud2>();
-    pointcloud_msg_->header.frame_id = params->depth_frame;
+    pointcloud_msg_->header.frame_id = params_->depth_frame;
     pointcloud_msg_->height = DEPTH_HEIGHT;
     pointcloud_msg_->width = DEPTH_WIDTH;
     pointcloud_msg_->fields.reserve(4);
@@ -147,16 +149,16 @@ bool Kinect2RosNode::is_okay()
 bool Kinect2RosNode::update(int timeout)
 {
   if (!is_okay()) {
-    RCLCPP_ERROR(this->get_logger(), "Cannot update; node is not healthy");
+    RCLCPP_ERROR(node->get_logger(), "Cannot update; node is not healthy");
     return false;
   }
 
   // Receive frames from Kinect.
   if (!listener_->waitForNewFrame(frames_, timeout)) {
-    RCLCPP_ERROR(this->get_logger(), "Timeout when receiving frame from Kinect");
+    RCLCPP_ERROR(node->get_logger(), "Timeout when receiving frame from Kinect");
     return false;
   }
-  rclcpp::Time now = this->get_clock()->now();
+  rclcpp::Time now = node->get_clock()->now();
   Frame* color_frame = frames_[Frame::Color];
   Frame* depth_frame = frames_[Frame::Depth];
   Frame* ir_frame = frames_[Frame::Ir];
@@ -206,9 +208,9 @@ bool Kinect2RosNode::update(int timeout)
   depth_cinfo_pub_.publish(depth_msg_, depth_cinfo_msg);
   ir_cinfo_pub_.publish(ir_msg_, depth_cinfo_msg);
 
-  if (enable_pointcloud_) {
+  if (params_->point_cloud.enabled) {
     // Apply registration to map the color frame onto the depth frame.
-    registration_->apply(color_frame, depth_frame, undistorted_, registered_, filter_pointcloud_);
+    registration_->apply(color_frame, depth_frame, undistorted_, registered_, params_->point_cloud.filter);
 
     // Construct pointcloud.
     pointcloud_msg_->header.stamp = now;
@@ -223,6 +225,7 @@ bool Kinect2RosNode::update(int timeout)
                                       new_point[1], new_point[2], new_point[3]);
 
         // Add to cloud.
+        new_point[0] *= -1;
         const uint8_t* new_point_u8 = reinterpret_cast<uint8_t*>(new_point);
         data->insert(data->end(), new_point_u8, new_point_u8 + 16);
       }

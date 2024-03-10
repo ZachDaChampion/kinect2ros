@@ -29,14 +29,14 @@ public:
   static const size_t COLOR_WIDTH = 1920;   //< Width of the color image.
   static const size_t COLOR_HEIGHT = 1080;  //< Height of the color image.
 
-  rclcpp::Node node;  //< The ROS2 node.
+  rclcpp::Node::SharedPtr node;  //< The ROS2 node.
 
   /**
    * Construct a new Kinect 2 Ros Node object.
    *
    * @param[in] options The options for the node.
    */
-  explicit Kinect2RosNode(const rclcpp::NodeOptions& options);
+  explicit Kinect2RosNode();
 
   /**
    * Destroy the Kinect 2 Ros Node object.
