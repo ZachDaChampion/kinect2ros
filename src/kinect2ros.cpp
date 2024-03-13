@@ -26,8 +26,8 @@ Kinect2RosNode::Kinect2RosNode()
     static_tf_broadcaster_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(node);
     geometry_msgs::msg::TransformStamped t;
     t.header.stamp = node->get_clock()->now();
-    t.header.frame_id = params_->depth_frame;
-    t.child_frame_id = params_->color_frame;
+    t.header.frame_id = params_->color_frame;
+    t.child_frame_id = params_->depth_frame;
     t.transform.translation.x = params_->transform.translation[0];
     t.transform.translation.y = params_->transform.translation[1];
     t.transform.translation.z = params_->transform.translation[2];
