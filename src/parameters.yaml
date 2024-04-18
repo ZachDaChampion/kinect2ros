@@ -65,7 +65,7 @@ kinect2ros:
     translation:
       {
         type: double_array,
-        default_value: [-0.06015, -0.00221, -0.02714],
+        default_value: [-0.06015, -0.00221, 0],
         description:
           "The translation between the color and depth camera frames. Default value is from
           DOI:10.3390/ijgi6110349",
